@@ -276,7 +276,7 @@ def generate_opportunity_space(
 if __name__ == "__main__":
     DOMAIN = "Sustainability"
 
-    with open('./data/cybersecurity_signals.json', 'r') as file:
+    with open('./data/sustainability_signals.json', 'r') as file:
         data = json.load(file)
 
 
