@@ -1,51 +1,49 @@
 import json
 import logging
 import os
+import sqlite3
+import time
 from typing import List
+
 from dotenv import load_dotenv
 from groq import Groq
 from pydantic import BaseModel, Field, field_validator
 from rapidfuzz import fuzz, process
 
-# pip install groq python-dotenv pydantic rapidfuzz
 # Setup Logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Load Environment Variables from project root .env
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY environment variable is not set. Please set it in your WSL session.")
+    raise ValueError("GROQ_API_KEY environment variable is not set.")
 
 client = Groq(api_key=GROQ_API_KEY)
-models = ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant", "openai/gpt-oss-120b"]
 MODEL_ID = "openai/gpt-oss-120b"
 
 
 # ==========================================
-# 1. PYDANTIC SCHEMAS FOR STRICT TYPING
+# 1. PYDANTIC SCHEMAS
 # ==========================================
 
 
 class TechnologyExtract(BaseModel):
-    rank: int
+    rank: int = Field(default=1) # Defaults to 1 if the LLM omits it
     technology_name: str
-    rationale: str
+    rationale: str = Field(default="")
     source_article_ids: List[str] = Field(default_factory=list)
 
     @field_validator("source_article_ids", mode="before")
     @classmethod
     def ensure_list(cls, v):
-        """Converts raw string, null, or invalid single values into a valid list."""
         if isinstance(v, str):
             return [v]
         if v is None:
             return []
         return v
-
 
 class Step1Response(BaseModel):
     domain: str
@@ -53,44 +51,77 @@ class Step1Response(BaseModel):
 
 
 # ==========================================
-# 2. STEP 1: EXTRACT TECH & SOURCE IDs
+# 2. STEP 1: EXTRACT TECHNOLOGIES
 # ==========================================
 
 STEP1_SYSTEM_PROMPT = """You are an expert technology foresight analyst specializing in domain innovation mapping.
 Your task is to analyze a list of articles (provided as JSON with ID and Title) and identify the top 5 hot, emerging technologies.
 
-Rules:
-1. Focus strictly on specific, actionable technologies (e.g., "Sodium-Ion Batteries", not generic "Clean Energy").
-2. Ensure all 5 technologies belong strictly to the target domain provided.
-3. Base your selection on frequency, market buzz, and operational novelty implied by the titles.
-4. For each identified technology, include the `source_article_ids` array containing exact article IDs from the input that support it.
-5. Output your response ONLY as a JSON object adhering strictly to the schema below.
+If you output any key other than "domain" or "top_5_emerging_technologies", your answer is invalid. 
+You MUST follow the exact schema. No alternative keys are allowed.
 
-Expected JSON Schema:
-{
-  "domain": "string",
-  "top_5_emerging_technologies": [
-    {
-      "rank": 1,
-      "technology_name": "string",
-      "rationale": "Brief 1-sentence explanation.",
-      "source_article_ids": ["art_01", "art_02"]
-    }
-  ]
-}
+Rules:
+1. Focus strictly on specific, actionable technologies.
+2. Ensure all 5 technologies belong strictly to the target domain.
+3. Base your selection on frequency, market buzz, and novelty.
+4. Include exact article IDs supporting each technology.
+5. Output ONLY valid JSON following the schema.
 """
 
 
-def extract_technologies(domain: str, raw_articles: list[dict]) -> dict:
-    """Sends light article payloads (ID + Title) to Step 1 and returns validated JSON."""
-    logging.info("Executing Step 1: Extracting Top Technologies...")
+def force_step1_schema(raw_json_str: str) -> dict:
+    data = json.loads(raw_json_str)
 
-    # Lighten input payload to save tokens
+    # 1. Fix root-level technologies key variations
+    if "technologies" in data and "top_5_emerging_technologies" not in data:
+        data["top_5_emerging_technologies"] = data.pop("technologies")
+
+    tech_list = data.get("top_5_emerging_technologies", [])
+
+    # 2. Iterate and sanitize item-level keys
+    for index, tech in enumerate(tech_list, start=1):
+        # Auto-assign rank if missing
+        if "rank" not in tech or tech["rank"] is None:
+            tech["rank"] = index
+
+        # Fix technology_name key aliases
+        if "technology" in tech and "technology_name" not in tech:
+            tech["technology_name"] = tech.pop("technology")
+        elif "name" in tech and "technology_name" not in tech:
+            tech["technology_name"] = tech.pop("name")
+
+        # Fix source_article_ids key aliases
+        if "article_ids" in tech and "source_article_ids" not in tech:
+            tech["source_article_ids"] = tech.pop("article_ids")
+        elif "articles" in tech and "source_article_ids" not in tech:
+            tech["source_article_ids"] = tech.pop("articles")
+
+        # Ensure string representations for IDs
+        if "source_article_ids" in tech:
+            tech["source_article_ids"] = [
+                str(aid) for aid in tech["source_article_ids"]
+            ]
+
+        # Fix rationale if missing
+        if "rationale" not in tech or not tech["rationale"]:
+            tech["rationale"] = "Identified from signals."
+
+    # 3. Ensure root domain key exists
+    if "domain" not in data:
+        data["domain"] = "unknown"
+
+    return data
+
+
+def extract_technologies(domain: str, raw_articles: list[dict]) -> dict:
+    logging.info(f"Executing Step 1: Extracting Top Technologies from {domain}")
+
     articles_payload = [
         {"id": a["id"], "title": a["title"]} for a in raw_articles
     ]
 
-    user_content = f"Target Domain: {domain}\n\nArticles List:\n{json.dumps(articles_payload, indent=2)}"
+    # Compact JSON string to conserve token count
+    user_content = f"Target Domain: {domain}\n\nArticles:\n{json.dumps(articles_payload, separators=(',', ':'))}"
 
     response = client.chat.completions.create(
         model=MODEL_ID,
@@ -103,14 +134,13 @@ def extract_technologies(domain: str, raw_articles: list[dict]) -> dict:
     )
 
     raw_json_str = response.choices[0].message.content
-
-    # Validate schema using Pydantic
-    validated_model = Step1Response.model_validate_json(raw_json_str)
+    safe_json = force_step1_schema(raw_json_str)
+    validated_model = Step1Response.model_validate(safe_json)
     return validated_model.model_dump()
 
 
 # ==========================================
-# 3. DEFENSIVE ID RESOLUTION & RAPIDFUZZ
+# 3. DEFENSIVE ID RESOLUTION
 # ==========================================
 
 
@@ -118,11 +148,7 @@ def resolve_and_filter_articles(
     step1_output: dict,
     raw_articles: list[dict],
     fuzzy_threshold: float = 70.0,
-) -> tuple[dict, list[dict]]:
-    """Resolves IDs via Set Intersection first, falling back to RapidFuzz title-matching
-
-    if LLM hallucinates or omits valid IDs.
-    """
+):
     valid_id_map = {article["id"]: article for article in raw_articles}
     valid_ids_set = set(valid_id_map.keys())
 
@@ -137,123 +163,100 @@ def resolve_and_filter_articles(
         tech_name = tech.get("technology_name", "")
         raw_ids = tech.get("source_article_ids", [])
 
-        # 1. Direct Set Intersection Validation
         valid_ids = list(set(raw_ids).intersection(valid_ids_set))
 
-        # Log hallucinated IDs if present
         hallucinated_ids = set(raw_ids) - valid_ids_set
         if hallucinated_ids:
             logging.warning(
-                f"LLM generated invalid IDs for '{tech_name}': {hallucinated_ids}"
+                f"LLM hallucinated IDs for '{tech_name}': {hallucinated_ids}"
             )
 
-        # 2. RapidFuzz Fallback if direct ID lookup failed
         if not valid_ids:
-            logging.info(
-                f"Attempting RapidFuzz title fallback for tech: '{tech_name}'..."
-            )
             match_result = process.extractOne(
                 tech_name, all_titles, scorer=fuzz.WRatio
             )
-
             if match_result and match_result[1] >= fuzzy_threshold:
                 matched_title, score, _ = match_result
-                matched_id = title_to_id_map[matched_title]
-                valid_ids.append(matched_id)
-                logging.info(
-                    f"RapidFuzz matched '{tech_name}' -> '{matched_title}' (ID: {matched_id}, Score: {score:.1f})"
-                )
+                valid_ids.append(title_to_id_map[matched_title])
             else:
-                logging.warning(
-                    f"No fuzzy match found above threshold {fuzzy_threshold}% for '{tech_name}'"
-                )
+                logging.warning(f"No fuzzy match found for '{tech_name}'")
 
-        # Sync resolved IDs back to Step 1 payload
         tech["source_article_ids"] = valid_ids
         collected_valid_ids.update(valid_ids)
 
-    # Filter raw article dictionaries by matched IDs
     filtered_articles = [
         valid_id_map[aid]
         for aid in collected_valid_ids
         if aid in valid_id_map
     ]
 
-    # Global safety net: Avoid sending zero articles to Step 2
-    if not filtered_articles and raw_articles:
-        logging.error(
-            "Global resolution failed. Defaulting to all articles for Step 2."
-        )
+    if not filtered_articles:
         filtered_articles = raw_articles
 
-    logging.info(
-        f"Filtered input: Passing {len(filtered_articles)} of {len(raw_articles)} full articles to Step 2."
-    )
     return step1_output, filtered_articles
 
 
 # ==========================================
-# 4. STEP 2: BUILD OPPORTUNITY SPACE
+# 4. STEP 2: BATCHED OPPORTUNITY SPACE GENERATION
 # ==========================================
 
-STEP2_SYSTEM_PROMPT = """You are a senior strategic analyst creating an Opportunity Space for emerging technologies.
-Analyze the provided article contents and URLs to evaluate the target technologies across key strategic dimensions.
+STEP2_SINGLE_SYSTEM_PROMPT = """You are a senior strategic analyst evaluating ONE emerging technology.
+Analyze the provided article contents and URLs to evaluate the target technology across key dimensions.
 
 Rules:
-1. Only extract signals and facts explicitly present in the provided article content.
-2. Ensure exact URL links from the input are preserved under the relevant signal categories.
-3. Provide objective scoring (1-10 scale) based on signal density and immediacy in the sources.
-4. Return ONLY valid JSON adhering strictly to the provided schema.
+1. Extract ONLY signals explicitly present in the article content.
+2. Preserve exact URLs.
+3. Provide objective scoring (1-10).
+4. Output ONLY valid JSON for this single technology adhering strictly to the schema below.
 
-Expected JSON Schema:
+Expected Schema:
 {
-  "opportunity_space": [
+  "technology_name": "string",
+  "overview_definition": "2-3 sentence clear technical overview",
+  "signals_and_sources": {
+    "regulation": [{"url": "string", "insight": "string"}],
+    "buying_signals": [{"url": "string", "insight": "string"}],
+    "market_trends": [{"url": "string", "insight": "string"}]
+  },
+  "use_cases_and_value_drivers": [
     {
-      "technology_name": "string",
-      "overview_definition": "2-3 sentence clear, high-level technical overview",
-      "signals_and_sources": {
-        "regulation": [{"url": "string", "insight": "string"}],
-        "buying_signals": [{"url": "string", "insight": "string"}],
-        "market_trends": [{"url": "string", "insight": "string"}]
-      },
-      "use_cases_and_value_drivers": [
-        {
-          "use_case": "string",
-          "value_driver": "e.g., 40% cost reduction, zero emissions"
-        }
-      ],
-      "target_audience": {
-        "personas": ["string"],
-        "verticals": ["string"],
-        "geographies": ["string"]
-      },
-      "scoring": {
-        "attractiveness_score": 8,
-        "attractiveness_rationale": "string",
-        "urgency_score": 7,
-        "urgency_rationale": "string"
-      }
+      "use_case": "string",
+      "value_driver": "e.g., 40% cost reduction"
     }
-  ]
+  ],
+  "target_audience": {
+    "personas": ["string"],
+    "verticals": ["string"],
+    "geographies": ["string"]
+  },
+  "scoring": {
+    "attractiveness_score": 8,
+    "attractiveness_rationale": "string",
+    "urgency_score": 7,
+    "urgency_rationale": "string"
+  }
 }
 """
 
 
-def generate_opportunity_space(
-    domain: str, step1_result: dict, filtered_articles: list[dict]
+def process_single_technology(
+    domain: str, tech_item: dict, target_articles: list[dict]
 ) -> dict:
-    """Sends sanitized output and filtered full articles to generate opportunity space."""
-    logging.info("Executing Step 2: Building Opportunity Space...")
+    """Processes a single technology against its supporting articles (~1,500 - 2,500 tokens)."""
+    tech_name = tech_item["technology_name"]
+    logging.info(f"Processing Step 2 for target tech: '{tech_name}'")
 
-    # Format filtered articles cleanly
     articles_formatted = ""
-    for article in filtered_articles:
-        articles_formatted += f"---\nID: {article['id']}\nURL: {article['url']}\nContent: {article['content']}\n\n"
+    for article in target_articles:
+        # Truncate content to first 1200 chars to avoid token inflation
+        truncated_body = article["content"][:1200]
+        articles_formatted += f"ID: {article['id']}\nURL: {article['url']}\nContent: {truncated_body}\n---\n"
 
     user_content = (
-        f"Target Domain: {domain}\n\n"
-        f"Target Emerging Technologies:\n{json.dumps(step1_result, indent=2)}\n\n"
-        f"Filtered Articles Data:\n{articles_formatted}"
+        f"Target Domain: {domain}\n"
+        f"Target Technology: {tech_name}\n"
+        f"Initial Rationale: {tech_item.get('rationale', '')}\n\n"
+        f"Supporting Articles:\n{articles_formatted}"
     )
 
     response = client.chat.completions.create(
@@ -261,7 +264,7 @@ def generate_opportunity_space(
         temperature=0.2,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": STEP2_SYSTEM_PROMPT},
+            {"role": "system", "content": STEP2_SINGLE_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
     )
@@ -269,39 +272,205 @@ def generate_opportunity_space(
     return json.loads(response.choices[0].message.content)
 
 
+def generate_opportunity_space(
+    domain: str, step1_result: dict, filtered_articles: list[dict]
+) -> dict:
+    """Map-Reduce Step 2: Processes each technology sequentially with rate-limit throttling."""
+    logging.info("Executing Step 2: Building Opportunity Spaces (Batched)...")
+
+    article_lookup = {a["id"]: a for a in filtered_articles}
+    opportunity_spaces = []
+
+    technologies = step1_result.get("top_5_emerging_technologies", [])
+    
+    for index, tech in enumerate(technologies):
+        source_ids = tech.get("source_article_ids", [])
+        mapped_articles = [
+            article_lookup[aid] for aid in source_ids if aid in article_lookup
+        ]
+
+        # Safety Fallback: If LLM hallucinated IDs and fuzzy match failed, use top 3 articles
+        if not mapped_articles:
+            logging.warning(
+                f"No valid articles mapped for '{tech.get('technology_name')}'. Falling back to default articles."
+            )
+            mapped_articles = filtered_articles[:3] if filtered_articles else []
+
+        # Process the single technology
+        opp_space = process_single_technology(domain, tech, mapped_articles)
+        opportunity_spaces.append(opp_space)
+
+        # Throttle: Sleep for 4 seconds between calls to prevent Groq 429 Rate Limits
+        if index < len(technologies) - 1:
+            logging.info("Throttling request to respect Groq rate limits...")
+            time.sleep(4)
+
+    return {"opportunity_space": opportunity_spaces}
+
+
 # ==========================================
-# 5. MAIN PIPELINE EXECUTION
+# 5. INSERT INTO DB TABLES
+# ==========================================
+
+
+def insert_opportunity_space(cursor, opp):
+    cursor.execute(
+        """
+        INSERT INTO opportunity_space (technology_name, overview_definition)
+        VALUES (?, ?)
+    """,
+        (opp["technology_name"], opp["overview_definition"]),
+    )
+    return cursor.lastrowid
+
+
+def insert_signals(cursor, opportunity_id, signals):
+    for category, items in signals.items():
+        for item in items:
+            cursor.execute(
+                """
+                INSERT INTO opportunity_signals (opportunity_id, article_id, signal_type, insight)
+                VALUES (?, ?, ?, ?)
+            """,
+                (
+                    opportunity_id,
+                    item.get("url", ""),
+                    category,
+                    item.get("insight", ""),
+                ),
+            )
+
+
+def insert_use_cases(cursor, opportunity_id, use_cases):
+    for uc in use_cases:
+        cursor.execute(
+            """
+            INSERT INTO use_cases (opportunity_id, use_case, value_driver)
+            VALUES (?, ?, ?)
+        """,
+            (opportunity_id, uc["use_case"], uc["value_driver"]),
+        )
+
+
+def insert_target_audience(cursor, opportunity_id, audience):
+    for persona in audience.get("personas", []):
+        cursor.execute(
+            """
+            INSERT INTO target_audience (opportunity_id, persona, vertical, geography)
+            VALUES (?, ?, ?, ?)
+        """,
+            (opportunity_id, persona, None, None),
+        )
+
+    for vertical in audience.get("verticals", []):
+        cursor.execute(
+            """
+            INSERT INTO target_audience (opportunity_id, persona, vertical, geography)
+            VALUES (?, ?, ?, ?)
+        """,
+            (opportunity_id, None, vertical, None),
+        )
+
+    for geo in audience.get("geographies", []):
+        cursor.execute(
+            """
+            INSERT INTO target_audience (opportunity_id, persona, vertical, geography)
+            VALUES (?, ?, ?, ?)
+        """,
+            (opportunity_id, None, None, geo),
+        )
+
+
+def insert_scoring(cursor, opportunity_id, scoring):
+    cursor.execute(
+        """
+        INSERT INTO scoring (
+            opportunity_id, 
+            attractiveness_score, 
+            attractiveness_rationale, 
+            urgency_score, 
+            urgency_rationale
+        ) VALUES (?, ?, ?, ?, ?)
+    """,
+        (
+            opportunity_id,
+            scoring["attractiveness_score"],
+            scoring["attractiveness_rationale"],
+            scoring["urgency_score"],
+            scoring["urgency_rationale"],
+        ),
+    )
+
+
+# ==========================================
+# 6. MAIN PIPELINE
 # ==========================================
 
 if __name__ == "__main__":
-    DOMAIN = "Sustainability"
+    from config import DOMAIN_KEYWORD_MAP
 
-    with open('./data/sustainability_signals.json', 'r') as file:
-        data = json.load(file)
+    for DOMAIN in DOMAIN_KEYWORD_MAP.keys():
 
+        conn = sqlite3.connect("./data/signals.db")
+        cursor = conn.cursor()
 
-    # Input dataset (including deliberate LLM edge cases like art_03)
-    RAW_ARTICLES = [{'id': article['id'], 'title': article['title'], 'url': article['url'], 'content': article['body']} for article in data['articles']['results']
-    ]
-    try:
-        # Step 1: Extract Technologies
-        step1_raw = extract_technologies(DOMAIN, RAW_ARTICLES)
-
-        # Intermediate Step: Defensive Filtering & RapidFuzz Fallback
-        step1_sanitized, filtered_articles = resolve_and_filter_articles(
-            step1_raw, RAW_ARTICLES
+        cursor.execute(
+            """
+            SELECT a.id, a.title, a.url, b.body
+            FROM articles a
+            JOIN article_bodies b ON a.id = b.article_id
+            WHERE a.domain = ?
+        """,
+            (DOMAIN,),
         )
 
-        print("\n=== STEP 1 SANITIZED OUTPUT ===")
-        print(json.dumps(step1_sanitized, indent=2))
+        rows = cursor.fetchall()
 
-        # Step 2: Build Opportunity Space
-        step2_final = generate_opportunity_space(
-            DOMAIN, step1_sanitized, filtered_articles
-        )
+        RAW_ARTICLES = [
+            {"id": row[0], "title": row[1], "url": row[2], "content": row[3]}
+            for row in rows
+        ]
 
-        print("\n=== STEP 2 FINAL OPPORTUNITY SPACE ===")
-        print(json.dumps(step2_final, indent=2))
+        conn.close()
 
-    except Exception as e:
-        logging.error(f"Pipeline execution error: {e}", exc_info=True)
+        if not RAW_ARTICLES:
+            logging.info(f"No articles found for domain: {DOMAIN}. Skipping...")
+            continue
+
+        try:
+            # Step 1: Extract Top Technologies
+            step1_raw = extract_technologies(DOMAIN, RAW_ARTICLES)
+            step1_sanitized, filtered_articles = resolve_and_filter_articles(
+                step1_raw, RAW_ARTICLES
+            )
+
+            # Step 2: Batched Execution
+            step2_final = generate_opportunity_space(
+                DOMAIN, step1_sanitized, filtered_articles
+            )
+
+            # Database Insertion
+            conn = sqlite3.connect("./data/signals.db")
+            cursor = conn.cursor()
+
+            for opp in step2_final["opportunity_space"]:
+                opp_id = insert_opportunity_space(cursor, opp)
+                insert_signals(
+                    cursor, opp_id, opp.get("signals_and_sources", {})
+                )
+                insert_use_cases(
+                    cursor
+                )
+                insert_target_audience(
+                    cursor, opp_id, opp.get("target_audience", {})
+                )
+                insert_scoring(cursor, opp_id, opp.get("scoring", {}))
+
+            conn.commit()
+            conn.close()
+            logging.info(f"Successfully processed domain: {DOMAIN}")
+
+        except Exception as e:
+            logging.error(f"Pipeline execution error: {e}", exc_info=True)
+
+        time.sleep(10)
