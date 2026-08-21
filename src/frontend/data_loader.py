@@ -49,6 +49,7 @@ def build_opportunity_space(
     space: sqlite3.Row,
 ) -> dict:
     opportunity_id = space["id"]
+    domain = space["domain"]
     scoring = fetch_scoring(connection, opportunity_id)
 
     return {
@@ -56,7 +57,7 @@ def build_opportunity_space(
         "domain": DB_DOMAIN_LABELS.get(space["domain"], space["domain"] or "Unassigned"),
         "technology_name": space["technology_name"],
         "overview_definition": space["overview_definition"],
-        "signals_and_sources": fetch_signals(connection, opportunity_id),
+        "signals_and_sources": fetch_signals(connection, opportunity_id, domain),
         "use_cases_and_value_drivers": fetch_use_cases(connection, opportunity_id),
         "target_audience": fetch_target_audience(connection, opportunity_id),
         "scoring": {
@@ -91,6 +92,7 @@ def fetch_scoring(
 def fetch_signals(
     connection: sqlite3.Connection,
     opportunity_id: int,
+    domain: str
 ) -> dict[str, list[dict]]:
     signals_by_type = {
         "regulation": [],
@@ -107,10 +109,10 @@ def fetch_signals(
                articles.url
         FROM opportunity_signals os
         LEFT JOIN articles ON articles.url = os.article_id
-        WHERE os.opportunity_id = ?
+        WHERE os.opportunity_id = ? AND articles.domain = ?
         ORDER BY os.id
         """,
-        (opportunity_id,),
+        (opportunity_id, domain),
     ).fetchall()
 
     for signal in signal_rows:
