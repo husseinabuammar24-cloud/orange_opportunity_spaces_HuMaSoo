@@ -11,7 +11,7 @@ Run this once to initialize the SQLite database.
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path("./data/signals.db")
+DB_PATH = Path("./data/New_signals.db")
 
 
 def create_tables():
